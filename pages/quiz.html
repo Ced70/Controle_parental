@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Un petit exercice…</title>
+  <!--
+    PAGE DE QUIZ — servie par le backend, relue à chaque requête.
+    Tu peux modifier librement le style, les textes, la musique : il suffit de
+    rafraîchir la page. Aucune recompilation, aucune re-signature de l'extension.
+    Paramètres reçus dans l'URL : ?retour=<url d'origine>&domaine=<hostname>
+  -->
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      background: radial-gradient(1200px 600px at 50% -10%, #1e293b, #0f172a);
+      color: #fff; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; padding: 1.5rem;
+    }
+    .carte {
+      width: 100%; max-width: 560px; background: #1e293b; border-radius: 20px; padding: 2rem;
+      box-shadow: 0 16px 50px rgba(0,0,0,.55); text-align: center;
+    }
+    h1 { font-size: 1.9rem; margin: 0 0 .4rem; }
+    h2 { font-size: 1.45rem; margin: 0 0 1.3rem; }
+    p.sous { opacity: .85; margin: 0 0 1.5rem; }
+    button {
+      display: block; width: 100%; margin: .55rem 0; padding: .85rem 1rem; font-size: 1.05rem;
+      font-weight: 600; border: none; border-radius: 12px; cursor: pointer; color: #fff; text-align: left;
+      transition: transform .05s ease;
+    }
+    button:active { transform: scale(.98); }
+    .badge {
+      display: inline-block; padding: .25rem .85rem; border-radius: 999px; font-size: .85rem;
+      font-weight: 700; margin-bottom: 1rem;
+    }
+    .retour { min-height: 1.4rem; margin: .7rem 0 0; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="carte" id="carte">Chargement…</div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const retour = params.get("retour") || "about:blank";
+    const domaine = params.get("domaine") || "";
+
+    // Niveaux récupérés depuis le backend (/config) → durées modifiables à chaud,
+    // toujours cohérentes avec ce que le serveur applique réellement.
+    let NIVEAUX = [];
+    const NIVEAUX_DEFAUT = [
+      { cle: "simple",    label: "Facile",    minutes: 2,  couleur: "#22c55e" },
+      { cle: "moyen",     label: "Moyen",     minutes: 5,  couleur: "#eab308" },
+      { cle: "difficile", label: "Difficile", minutes: 10, couleur: "#ef4444" },
+    ];
+
+    const carte = document.getElementById("carte");
+
+    // --- Petite musique d'ouverture (générée, pas de fichier) ---------------
+    function jouerJingle() {
+      try {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        const ctx = new Ctx();
+        const jouer = () => {
+          const notes = [523.25, 659.25, 783.99, 1046.5]; // Do Mi Sol Do
+          const t0 = ctx.currentTime + 0.04;
+          notes.forEach((f, i) => {
+            const osc = ctx.createOscillator();
+            const g = ctx.createGain();
+            osc.type = "triangle";
+            osc.frequency.value = f;
+            const t = t0 + i * 0.13;
+            g.gain.setValueAtTime(0.0001, t);
+            g.gain.linearRampToValueAtTime(0.18, t + 0.02);
+            g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+            osc.connect(g).connect(ctx.destination);
+            osc.start(t); osc.stop(t + 0.24);
+          });
+          setTimeout(() => ctx.close(), 1500);
+        };
+        if (ctx.state === "suspended") {
+          ctx.resume().then(jouer).catch(() => {
+            const g = () => { ctx.resume().then(jouer); document.removeEventListener("pointerdown", g); };
+            document.addEventListener("pointerdown", g, { once: true });
+          });
+        } else { jouer(); }
+      } catch (e) { /* silencieux */ }
+    }
+
+    // --- Écrans -------------------------------------------------------------
+    function ecranNiveaux(message) {
+      carte.innerHTML = "";
+      const h = document.createElement("h1");
+      h.textContent = "🔒 Page verrouillée";
+      const p = document.createElement("p");
+      p.className = "sous";
+      p.textContent = message || "Choisis un défi pour débloquer la page :";
+      carte.append(h, p);
+      for (const n of NIVEAUX) {
+        const b = document.createElement("button");
+        b.style.background = n.couleur;
+        b.textContent = `${n.label} — débloque ${n.minutes} min`;
+        b.onclick = () => chargerQuestion(n);
+        carte.appendChild(b);
+      }
+    }
+
+    const dejaVues = new Set(); // pour éviter de reproposer une question récente
+    async function chargerQuestion(n) {
+      carte.innerHTML = "<p class='sous'>Chargement…</p>";
+      try {
+        let q = null;
+        for (let essai = 0; essai < 6; essai++) {
+          q = await (await fetch("/quiz/question?niveau=" + n.cle)).json();
+          if (!q || !q.choix) throw 0;
+          if (!dejaVues.has(q.id)) break;
+        }
+        if (dejaVues.size > 60) dejaVues.clear();
+        dejaVues.add(q.id);
+        ecranQuestion(n, q);
+      } catch (e) {
+        ecranNiveaux("Impossible de charger la question, réessaie.");
+      }
+    }
+
+    function ecranQuestion(n, q) {
+      carte.innerHTML = "";
+      const badge = document.createElement("div");
+      badge.className = "badge"; badge.style.background = n.couleur;
+      badge.textContent = `${n.label} · ${n.minutes} min`;
+      const h = document.createElement("h2");
+      h.textContent = q.enonce;
+      carte.append(badge, h);
+
+      const info = document.createElement("p");
+      info.className = "retour";
+
+      let essais = 0;
+      let verrou = false; // empêche le double-clic pendant l'appel réseau
+      const boutons = [];
+
+      q.choix.forEach((choix, i) => {
+        const b = document.createElement("button");
+        b.style.background = "#334155";
+        b.textContent = choix;
+        b.onclick = () => repondre(i, b);
+        boutons.push(b);
+        carte.appendChild(b);
+      });
+
+      const chg = document.createElement("button");
+      chg.style.background = "#0f172a";
+      chg.textContent = "← Changer de difficulté";
+      chg.onclick = () => ecranNiveaux("Choisis un défi :");
+      carte.append(info, chg);
+
+      async function repondre(i, bouton) {
+        if (verrou) return;
+        verrou = true;
+        let r;
+        try {
+          r = await (await fetch("/quiz/valider", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question_id: q.id, choix: i, domaine }),
+          })).json();
+        } catch (e) {
+          info.textContent = "Erreur réseau, réessaie."; info.style.color = "#f87171";
+          verrou = false; return;
+        }
+
+        if (r && r.ok) {
+          carte.innerHTML = "<h1>🎉 " + r.message + "</h1><p class='sous'>Retour à la page…</p>";
+          setTimeout(() => { location.href = retour; }, 1300);
+          return;
+        }
+
+        // Mauvaise réponse : on grise le bouton choisi.
+        essais += 1;
+        bouton.disabled = true;
+        bouton.style.background = "#7f1d1d";
+        bouton.style.opacity = "0.6";
+
+        if (essais < 2) {
+          info.style.color = "#f87171";
+          info.textContent = "❌ Mauvaise réponse — il te reste 1 essai. Lis bien la question !";
+          verrou = false; // on autorise le 2e essai
+          return;
+        }
+
+        // 2e échec : on révèle la bonne réponse, on bloque tout, délai de 10 s, puis nouvelle question.
+        boutons.forEach((b) => (b.disabled = true));
+        if (r.bonne >= 0 && boutons[r.bonne]) {
+          boutons[r.bonne].style.background = "#166534"; // vert
+          boutons[r.bonne].style.opacity = "1";
+        }
+        chg.disabled = true;
+        const bonneTxt = (r.bonne >= 0 && q.choix[r.bonne] != null) ? q.choix[r.bonne] : "?";
+        let reste = 10;
+        info.style.color = "#fbbf24";
+        const maj = () => (info.textContent =
+          `La bonne réponse était « ${bonneTxt} ». Nouvelle question dans ${reste} s…`);
+        maj();
+        const tic = setInterval(() => {
+          reste -= 1;
+          if (reste <= 0) { clearInterval(tic); chargerQuestion(n); } else { maj(); }
+        }, 1000);
+      }
+    }
+
+    jouerJingle();
+    // On charge les niveaux depuis le backend, puis on affiche l'écran de choix.
+    fetch("/config")
+      .then((r) => r.json())
+      .then((c) => { NIVEAUX = (c && c.niveaux && c.niveaux.length) ? c.niveaux : NIVEAUX_DEFAUT; })
+      .catch(() => { NIVEAUX = NIVEAUX_DEFAUT; })
+      .finally(() => ecranNiveaux());
+  </script>
+</body>
+</html>

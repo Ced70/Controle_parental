@@ -1,0 +1,20 @@
+/target
+
+# Config IDE
+.idea/
+
+# Python (générateur de questions)
+__pycache__/
+
+# Base de données générée à l'exécution (pas de données versionnées)
+*.db
+*.db-journal
+*.db-wal
+
+# Artefacts d'empaquetage de l'extension
+*.zip
+*.xpi
+
+# Secrets (clé API YouTube, variables d'env)
+youtube_api.key
+.env

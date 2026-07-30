@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Contrôle Parental Intelligent",
+  "version": "0.6.0",
+  "description": "Bloque ou conditionne l'accès à certains sites via un quiz de révision.",
+
+  "host_permissions": ["http://192.168.1.51:8090/*"],
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' http://192.168.1.51:8090"
+  },
+
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"]
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "controle-parental@maison.local",
+      "strict_min_version": "128.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  }
+}

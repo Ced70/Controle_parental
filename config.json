@@ -1,0 +1,22 @@
+{
+  "niveaux": [
+    {
+      "cle": "simple",
+      "label": "Facile",
+      "minutes": 2,
+      "couleur": "#22c55e"
+    },
+    {
+      "cle": "moyen",
+      "label": "Moyen",
+      "minutes": 5,
+      "couleur": "#eab308"
+    },
+    {
+      "cle": "difficile",
+      "label": "Difficile",
+      "minutes": 10,
+      "couleur": "#ef4444"
+    }
+  ]
+}

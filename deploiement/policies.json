@@ -1,0 +1,11 @@
+{
+  "policies": {
+    "ExtensionSettings": {
+      "controle-parental@maison.local": {
+        "installation_mode": "force_installed",
+        "install_url": "file:///C:/ControleParental/controle_parental.xpi"
+      }
+    },
+    "DisableTelemetry": false
+  }
+}
