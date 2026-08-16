@@ -397,6 +397,9 @@ fn charger_questions_fichier(conn: &Connection) {
             return;
         }
     };
+    // Une seule transaction pour tout le rechargement : sans elle, chaque INSERT
+    // paie un fsync — plusieurs minutes de démarrage sur carte SD (Raspberry Pi).
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     conn.execute("DELETE FROM questions", []).unwrap();
     let mut n = 0;
     for q in &banque.questions {
@@ -411,6 +414,7 @@ fn charger_questions_fichier(conn: &Connection) {
             n += 1;
         }
     }
+    conn.execute_batch("COMMIT").unwrap();
     println!("{n} questions chargées depuis questions.json.");
 }
 
