@@ -9,6 +9,7 @@
     Tu peux modifier librement le style, les textes, la musique : il suffit de
     rafraîchir la page. Aucune recompilation, aucune re-signature de l'extension.
     Paramètres reçus dans l'URL : ?retour=<url d'origine>&domaine=<hostname>
+                                  [&appareil=<identifiant>] (app Android uniquement)
   -->
   <style>
     :root { color-scheme: dark; }
@@ -45,6 +46,9 @@
     const params = new URLSearchParams(location.search);
     const retour = params.get("retour") || "about:blank";
     const domaine = params.get("domaine") || "";
+    // Identifiant d'appareil transmis par l'app Android ; l'extension Firefox ne
+    // l'envoie pas → le serveur retombe sur l'IP (comportement historique).
+    const appareil = (params.get("appareil") || "").trim();
 
     // Niveaux récupérés depuis le backend (/config) → durées modifiables à chaud,
     // toujours cohérentes avec ce que le serveur applique réellement.
@@ -164,7 +168,11 @@
           r = await (await fetch("/quiz/valider", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ question_id: q.id, choix: i, domaine }),
+            body: JSON.stringify(
+              appareil
+                ? { question_id: q.id, choix: i, domaine, appareil }
+                : { question_id: q.id, choix: i, domaine }
+            ),
           })).json();
         } catch (e) {
           info.textContent = "Erreur réseau, réessaie."; info.style.color = "#f87171";

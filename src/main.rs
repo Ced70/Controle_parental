@@ -72,6 +72,21 @@ fn duree_minutes(niveau: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// Clé identifiant l'appareil : identifiant explicite si fourni et valide, sinon IP source.
+/// Le préfixe `id:`/`ip:` évite toute collision entre un identifiant et une vraie IP.
+fn cle_appareil(appareil: &Option<String>, addr: &SocketAddr) -> String {
+    match appareil.as_deref().map(str::trim) {
+        Some(a)
+            if !a.is_empty()
+                && a.len() <= 64
+                && a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+        {
+            format!("id:{a}")
+        }
+        _ => format!("ip:{}", addr.ip()),
+    }
+}
+
 fn maintenant() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
@@ -98,6 +113,8 @@ fn charger_cle_youtube() -> Option<String> {
 struct DecisionRequest {
     domaine: String,
     url: String,
+    #[serde(default)]
+    appareil: Option<String>, // identifiant d'appareil, optionnel (app Android)
 }
 
 #[derive(Debug, Serialize)]
@@ -141,6 +158,8 @@ struct ValiderRequest {
     question_id: i64,
     choix: i64,
     domaine: String,
+    #[serde(default)]
+    appareil: Option<String>, // identifiant d'appareil, optionnel (app Android)
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +180,49 @@ fn rep_quiz() -> DecisionResponse {
 }
 fn rep_allow() -> DecisionResponse {
     DecisionResponse { action: Action::Allow, message: String::new(), restant_sec: None }
+}
+fn rep_block() -> DecisionResponse {
+    DecisionResponse { action: Action::Block, message: MESSAGE_BLOCAGE.to_string(), restant_sec: None }
+}
+
+// ---------------------------------------------------------------------------
+// Politiques par appareil (mode « blocage net » : quiz désactivé)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Politique {
+    appareil: String,
+    mode: String, // "block" = vidéos quiz bloquées net ; "quiz" = comportement normal
+}
+
+/// Normalise une clé de politique : accepte `tel-nathou`, `id:tel-nathou` ou `192.168.1.16`.
+fn normaliser_cle_politique(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with("id:") || s.starts_with("ip:") {
+        s.to_string()
+    } else if s.parse::<std::net::IpAddr>().is_ok() {
+        format!("ip:{s}")
+    } else {
+        format!("id:{s}")
+    }
+}
+
+/// L'appareil est-il en mode « blocage net » (quiz désactivé) ?
+fn quiz_bloque_pour(conn: &Connection, appareil: &str) -> bool {
+    conn.query_row(
+        "SELECT mode FROM politiques_appareils WHERE appareil = ?1",
+        params![appareil],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .unwrap()
+    .as_deref()
+        == Some("block")
+}
+
+/// Convertit un éventuel « quiz » en blocage net si la politique de l'appareil l'exige.
+fn appliquer_politique(rep: DecisionResponse, bloquer: bool) -> DecisionResponse {
+    if bloquer && matches!(rep.action, Action::Quiz) { rep_block() } else { rep }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,13 +302,18 @@ fn init_db() -> Connection {
             video_id    TEXT PRIMARY KEY,
             category_id TEXT NOT NULL,
             vu_at       INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS politiques_appareils (
+            appareil TEXT PRIMARY KEY,
+            mode     TEXT NOT NULL CHECK(mode IN ('quiz','block'))
         );",
     )
     .expect("création des tables");
 
-    // Table des déblocages : indexée par appareil (IP) + domaine, pour qu'un
-    // déblocage sur un PC ne débloque pas les autres. Migration : si une vieille
-    // table sans colonne `ip` existe, on la recrée (données transitoires).
+    // Table des déblocages : indexée par appareil (identifiant explicite préfixé `id:`
+    // ou IP préfixée `ip:`) + domaine, pour qu'un déblocage sur un appareil ne débloque
+    // pas les autres. Migration : si une vieille table sans colonne `appareil` existe,
+    // on la recrée (données transitoires, ≤ 10 min).
     let colonnes: Vec<String> = {
         let mut stmt = conn.prepare("PRAGMA table_info(deblocages)").unwrap();
         let cols = stmt
@@ -256,15 +323,15 @@ fn init_db() -> Connection {
             .collect();
         cols
     };
-    if !colonnes.is_empty() && !colonnes.iter().any(|c| c == "ip") {
+    if !colonnes.is_empty() && !colonnes.iter().any(|c| c == "appareil") {
         conn.execute("DROP TABLE deblocages", []).unwrap();
     }
     conn.execute(
         "CREATE TABLE IF NOT EXISTS deblocages (
-            ip        TEXT NOT NULL,
+            appareil  TEXT NOT NULL,
             domaine   TEXT NOT NULL,
             expire_at INTEGER NOT NULL,
-            PRIMARY KEY (ip, domaine)
+            PRIMARY KEY (appareil, domaine)
         )",
         [],
     )
@@ -418,30 +485,35 @@ async fn decision(
     Json(req): Json<DecisionRequest>,
 ) -> Json<DecisionResponse> {
     let now = maintenant();
-    let ip = addr.ip().to_string(); // appareil qui fait la requête
+    let appareil = cle_appareil(&req.appareil, &addr); // appareil qui fait la requête
 
-    // --- Phase synchrone (sous verrou) : déblocage, règle, cache catégorie ---
+    // --- Phase synchrone (sous verrou) : politique, déblocage, règle, cache catégorie ---
     // Le bloc renvoie l'ID de la vidéo à classer ; tous les autres cas font `return`.
-    let video_id: String = {
+    let (video_id, bloquer): (String, bool) = {
         let conn = st.db.lock().unwrap();
 
-        // 1) Déblocage encore actif POUR CET APPAREIL ?
-        let expire_at: Option<i64> = conn
-            .query_row(
-                "SELECT expire_at FROM deblocages
-                 WHERE ip = ?1 AND ?2 LIKE '%' || domaine || '%' AND expire_at > ?3
-                 ORDER BY expire_at DESC LIMIT 1",
-                params![ip, req.domaine, now],
-                |r| r.get(0),
-            )
-            .optional()
-            .unwrap();
-        if let Some(expire_at) = expire_at {
-            return Json(DecisionResponse {
-                action: Action::Allow,
-                message: "Débloqué ✅".to_string(),
-                restant_sec: Some(expire_at - now), // temps restant pour le minuteur côté extension
-            });
+        // 0) Politique de l'appareil : « block » = quiz désactivé, vidéos bloquées net.
+        let bloquer = quiz_bloque_pour(&conn, &appareil);
+
+        // 1) Déblocage encore actif POUR CET APPAREIL ? (sans objet en mode blocage net)
+        if !bloquer {
+            let expire_at: Option<i64> = conn
+                .query_row(
+                    "SELECT expire_at FROM deblocages
+                     WHERE appareil = ?1 AND ?2 LIKE '%' || domaine || '%' AND expire_at > ?3
+                     ORDER BY expire_at DESC LIMIT 1",
+                    params![appareil, req.domaine, now],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            if let Some(expire_at) = expire_at {
+                return Json(DecisionResponse {
+                    action: Action::Allow,
+                    message: "Débloqué ✅".to_string(),
+                    restant_sec: Some(expire_at - now), // temps restant pour le minuteur côté extension
+                });
+            }
         }
 
         // 2) Règle applicable ?
@@ -457,13 +529,7 @@ async fn decision(
             .unwrap();
 
         match action.as_deref() {
-            Some("block") => {
-                return Json(DecisionResponse {
-                    action: Action::Block,
-                    message: MESSAGE_BLOCAGE.to_string(),
-                    restant_sec: None,
-                });
-            }
+            Some("block") => return Json(rep_block()),
             Some("quiz") => {
                 // Intelligence YouTube uniquement si une clé API est configurée.
                 if est_youtube(&req.domaine) && st.yt_cle.is_some() {
@@ -479,8 +545,8 @@ async fn decision(
                                 .optional()
                                 .unwrap();
                             match cat {
-                                Some(c) => return Json(decision_youtube(&c)),
-                                None => vid, // valeur du bloc -> classée via l'API hors verrou
+                                Some(c) => return Json(appliquer_politique(decision_youtube(&c), bloquer)),
+                                None => (vid, bloquer), // valeur du bloc -> classée via l'API hors verrou
                             }
                         }
                         // Page YouTube hors vidéo (accueil, recherche) : on laisse naviguer.
@@ -488,7 +554,7 @@ async fn decision(
                     }
                 } else {
                     // Pas YouTube, ou pas de clé : comportement classique = quiz.
-                    return Json(rep_quiz());
+                    return Json(appliquer_politique(rep_quiz(), bloquer));
                 }
             }
             _ => return Json(rep_allow()),
@@ -506,10 +572,10 @@ async fn decision(
                 "INSERT OR REPLACE INTO categories_videos (video_id, category_id, vu_at) VALUES (?1, ?2, ?3)",
                 params![video_id, cat, now],
             );
-            Json(decision_youtube(&cat))
+            Json(appliquer_politique(decision_youtube(&cat), bloquer))
         }
         // Échec API : on retombe prudemment sur le quiz.
-        None => Json(rep_quiz()),
+        None => Json(appliquer_politique(rep_quiz(), bloquer)),
     }
 }
 
@@ -545,8 +611,18 @@ async fn quiz_valider(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<ValiderRequest>,
 ) -> Json<ValiderResponse> {
-    let ip = addr.ip().to_string();
+    let appareil = cle_appareil(&req.appareil, &addr);
     let conn = st.db.lock().unwrap();
+
+    // Mode « blocage net » : pas de déblocage possible par le quiz.
+    if quiz_bloque_pour(&conn, &appareil) {
+        return Json(ValiderResponse {
+            ok: false,
+            duree_min: 0,
+            message: "Le quiz est désactivé pour cet appareil.".to_string(),
+            bonne: -1,
+        });
+    }
 
     let info: Option<(i64, String)> = conn
         .query_row(
@@ -592,9 +668,9 @@ async fn quiz_valider(
 
     let expire = maintenant() + duree * 60;
     conn.execute(
-        "INSERT INTO deblocages (ip, domaine, expire_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(ip, domaine) DO UPDATE SET expire_at = excluded.expire_at",
-        params![ip, cle, expire],
+        "INSERT INTO deblocages (appareil, domaine, expire_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(appareil, domaine) DO UPDATE SET expire_at = excluded.expire_at",
+        params![appareil, cle, expire],
     )
     .unwrap();
 
@@ -639,6 +715,48 @@ async fn ajouter_regle(
     Ok(Json(regle))
 }
 
+/// Liste les appareils en mode particulier (absent de la liste = quiz normal).
+async fn lister_politiques(State(st): State<AppState>) -> Json<Vec<Politique>> {
+    let conn = st.db.lock().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT appareil, mode FROM politiques_appareils ORDER BY appareil")
+        .unwrap();
+    let politiques = stmt
+        .query_map([], |row| Ok(Politique { appareil: row.get(0)?, mode: row.get(1)? }))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    Json(politiques)
+}
+
+/// Bascule un appareil : mode "block" = vidéos quiz bloquées net ; "quiz" = retour au
+/// comportement normal (la ligne est supprimée). La clé est normalisée (`id:`/`ip:`).
+async fn definir_politique(
+    State(st): State<AppState>,
+    Json(p): Json<Politique>,
+) -> Result<Json<Politique>, (StatusCode, String)> {
+    if p.mode != "quiz" && p.mode != "block" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "le champ 'mode' doit valoir 'quiz' ou 'block'".to_string(),
+        ));
+    }
+    let cle = normaliser_cle_politique(&p.appareil);
+    let conn = st.db.lock().unwrap();
+    if p.mode == "quiz" {
+        conn.execute("DELETE FROM politiques_appareils WHERE appareil = ?1", params![cle])
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    } else {
+        conn.execute(
+            "INSERT INTO politiques_appareils (appareil, mode) VALUES (?1, 'block')
+             ON CONFLICT(appareil) DO UPDATE SET mode = 'block'",
+            params![cle],
+        )
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
+    Ok(Json(Politique { appareil: cle, mode: p.mode }))
+}
+
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
@@ -659,6 +777,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/decision", post(decision))
         .route("/regles", get(lister_regles).post(ajouter_regle))
+        .route("/politiques", get(lister_politiques).post(definir_politique))
         .route("/quiz/question", get(quiz_question))
         .route("/quiz/valider", post(quiz_valider))
         .route("/ecran/quiz", get(ecran_quiz))

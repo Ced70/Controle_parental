@@ -18,3 +18,7 @@ __pycache__/
 # Secrets (clé API YouTube, variables d'env)
 youtube_api.key
 .env
+
+# Journal du serveur et sauvegardes locales
+serveur.log
+*.bak-avant-appareil
