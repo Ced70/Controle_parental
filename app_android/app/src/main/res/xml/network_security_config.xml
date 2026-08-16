@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- HTTP en clair autorisé UNIQUEMENT vers le backend de la maison (DGX).
+     Tout le reste (YouTube…) passe en HTTPS normal.
+     Si l'URL du backend change (ex. IP Tailscale), ajouter le domaine ici. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.1.51</domain>
+        <!-- Émulateur Android Studio : 10.0.2.2 = localhost du Mac (utile en dev) -->
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Triangle « play » blanc + chapeau de diplômé (clin d'œil au quiz).
+     Zone sûre des icônes adaptatives : cercle central de 66dp sur 108dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Triangle play, arrondi visuellement par le fond -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M44,40 L44,74 L73,57 Z" />
+
+    <!-- Chapeau de diplômé : mortier (losange) posé au-dessus du triangle -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M54,24 L71,31.5 L54,39 L37,31.5 Z" />
+    <!-- Fond du chapeau (calotte) -->
+    <path
+        android:fillColor="#1A1A2E"
+        android:pathData="M46,35 L46,41 Q54,45 62,41 L62,35 L54,38.5 Z" />
+    <!-- Pompon -->
+    <path
+        android:strokeColor="#FFD34D"
+        android:strokeWidth="2"
+        android:fillColor="#00000000"
+        android:pathData="M71,31.5 L71,40" />
+    <path
+        android:fillColor="#FFD34D"
+        android:pathData="M71,40 m-2.5,0 a2.5,2.5 0 1,1 5,0 a2.5,2.5 0 1,1 -5,0" />
+</vector>
