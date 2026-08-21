@@ -35,7 +35,7 @@ const CATEGORIES_QUIZ: &[&str] = &["20", "24", "23"];
 struct Niveau {
     cle: String,
     label: String,
-    minutes: i64,
+    minutes: f64, // fractions permises (ex. 2.5 = 2 min 30)
     couleur: String,
 }
 
@@ -47,9 +47,9 @@ struct Config {
 fn config_par_defaut() -> Config {
     Config {
         niveaux: vec![
-            Niveau { cle: "simple".into(), label: "Facile".into(), minutes: 2, couleur: "#22c55e".into() },
-            Niveau { cle: "moyen".into(), label: "Moyen".into(), minutes: 5, couleur: "#eab308".into() },
-            Niveau { cle: "difficile".into(), label: "Difficile".into(), minutes: 10, couleur: "#ef4444".into() },
+            Niveau { cle: "simple".into(), label: "Facile".into(), minutes: 1.0, couleur: "#22c55e".into() },
+            Niveau { cle: "moyen".into(), label: "Moyen".into(), minutes: 2.5, couleur: "#eab308".into() },
+            Niveau { cle: "difficile".into(), label: "Difficile".into(), minutes: 5.0, couleur: "#ef4444".into() },
         ],
     }
 }
@@ -62,14 +62,27 @@ fn charger_config() -> Config {
         .unwrap_or_else(config_par_defaut)
 }
 
-/// Durée de déblocage (minutes) du niveau, depuis la config (0 si niveau inconnu).
-fn duree_minutes(niveau: &str) -> i64 {
+/// Durée de déblocage (minutes, fractions permises) du niveau, depuis la config
+/// (0 si niveau inconnu).
+fn duree_minutes(niveau: &str) -> f64 {
     charger_config()
         .niveaux
         .iter()
         .find(|n| n.cle == niveau)
         .map(|n| n.minutes)
-        .unwrap_or(0)
+        .unwrap_or(0.0)
+}
+
+/// « 1 minute », « 5 minutes », « 2 min 30 »… pour les messages du quiz.
+fn format_duree(minutes: f64) -> String {
+    let total_sec = (minutes * 60.0).round() as i64;
+    let (m, s) = (total_sec / 60, total_sec % 60);
+    match (m, s) {
+        (0, s) => format!("{s} secondes"),
+        (1, 0) => "1 minute".to_string(),
+        (m, 0) => format!("{m} minutes"),
+        (m, s) => format!("{m} min {s:02}"),
+    }
 }
 
 /// Clé identifiant l'appareil : identifiant explicite si fourni et valide, sinon IP source.
@@ -146,11 +159,16 @@ struct QuestionPublique {
     niveau: String,
     enonce: String,
     choix: Vec<String>,
+    // La question était déjà en cours pour cet appareil (reload/retour) :
+    // la page saute alors son filtre anti-répétition.
+    epinglee: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct QuestionQuery {
     niveau: String,
+    #[serde(default)]
+    appareil: Option<String>, // identifiant d'appareil, optionnel (app Android)
 }
 
 #[derive(Debug, Deserialize)]
@@ -165,7 +183,7 @@ struct ValiderRequest {
 #[derive(Debug, Serialize)]
 struct ValiderResponse {
     ok: bool,
-    duree_min: i64,
+    duree_min: f64,
     message: String,
     bonne: i64, // index de la bonne réponse (pour révélation après échec) ; -1 si inconnu
 }
@@ -306,6 +324,11 @@ fn init_db() -> Connection {
         CREATE TABLE IF NOT EXISTS politiques_appareils (
             appareil TEXT PRIMARY KEY,
             mode     TEXT NOT NULL CHECK(mode IN ('quiz','block'))
+        );
+        CREATE TABLE IF NOT EXISTS questions_en_cours (
+            appareil    TEXT PRIMARY KEY,
+            question_id INTEGER NOT NULL,
+            depuis      INTEGER NOT NULL
         );",
     )
     .expect("création des tables");
@@ -583,14 +606,46 @@ async fn decision(
     }
 }
 
+/// Durée de vie d'une question épinglée (garde-fou anti-blocage).
+const EPINGLAGE_TTL_SEC: i64 = 600;
+
 async fn quiz_question(
     State(st): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(q): Query<QuestionQuery>,
 ) -> Result<Json<QuestionPublique>, (StatusCode, String)> {
-    if duree_minutes(&q.niveau) == 0 {
+    if duree_minutes(&q.niveau) <= 0.0 {
         return Err((StatusCode::BAD_REQUEST, "niveau invalide".to_string()));
     }
+    let appareil = cle_appareil(&q.appareil, &addr);
+    let now = maintenant();
     let conn = st.db.lock().unwrap();
+
+    // Purge des épinglages expirés (bon marché, table minuscule).
+    conn.execute(
+        "DELETE FROM questions_en_cours WHERE depuis < ?1",
+        params![now - EPINGLAGE_TTL_SEC],
+    )
+    .unwrap();
+
+    // Anti-esquive : une question déjà distribuée à cet appareil et jamais
+    // répondue est resservie telle quelle — reload, retour arrière ou
+    // changement de niveau n'y changent rien. Il faut répondre une fois.
+    let epinglee: Option<(i64, String, String, String)> = conn
+        .query_row(
+            "SELECT q.id, q.niveau, q.enonce, q.choix
+             FROM questions_en_cours e JOIN questions q ON q.id = e.question_id
+             WHERE e.appareil = ?1",
+            params![appareil],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .unwrap();
+    if let Some((id, niveau, enonce, choix_json)) = epinglee {
+        let choix: Vec<String> = serde_json::from_str(&choix_json).unwrap_or_default();
+        return Ok(Json(QuestionPublique { id, niveau, enonce, choix, epinglee: true }));
+    }
+
     let res: Option<(i64, String, String, String)> = conn
         .query_row(
             "SELECT id, niveau, enonce, choix FROM questions
@@ -604,7 +659,13 @@ async fn quiz_question(
     match res {
         Some((id, niveau, enonce, choix_json)) => {
             let choix: Vec<String> = serde_json::from_str(&choix_json).unwrap_or_default();
-            Ok(Json(QuestionPublique { id, niveau, enonce, choix }))
+            conn.execute(
+                "INSERT INTO questions_en_cours (appareil, question_id, depuis) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(appareil) DO UPDATE SET question_id = excluded.question_id, depuis = excluded.depuis",
+                params![appareil, id, now],
+            )
+            .unwrap();
+            Ok(Json(QuestionPublique { id, niveau, enonce, choix, epinglee: false }))
         }
         None => Err((StatusCode::NOT_FOUND, "aucune question pour ce niveau".to_string())),
     }
@@ -622,7 +683,7 @@ async fn quiz_valider(
     if quiz_bloque_pour(&conn, &appareil) {
         return Json(ValiderResponse {
             ok: false,
-            duree_min: 0,
+            duree_min: 0.0,
             message: "Le quiz est désactivé pour cet appareil.".to_string(),
             bonne: -1,
         });
@@ -642,17 +703,25 @@ async fn quiz_valider(
         None => {
             return Json(ValiderResponse {
                 ok: false,
-                duree_min: 0,
+                duree_min: 0.0,
                 message: "Question introuvable.".to_string(),
                 bonne: -1,
             });
         }
     };
 
+    // Une vraie réponse a été donnée (bonne ou mauvaise) : la question n'est
+    // plus épinglée — l'enfant a « payé » son droit de passer à la suivante.
+    conn.execute(
+        "DELETE FROM questions_en_cours WHERE appareil = ?1",
+        params![appareil],
+    )
+    .unwrap();
+
     if req.choix != bonne {
         return Json(ValiderResponse {
             ok: false,
-            duree_min: 0,
+            duree_min: 0.0,
             message: "Mauvaise réponse".to_string(),
             bonne, // l'extension révèle la bonne réponse après le 2e échec
         });
@@ -670,7 +739,7 @@ async fn quiz_valider(
         .unwrap()
         .unwrap_or_else(|| req.domaine.clone());
 
-    let expire = maintenant() + duree * 60;
+    let expire = maintenant() + (duree * 60.0).round() as i64;
     conn.execute(
         "INSERT INTO deblocages (appareil, domaine, expire_at) VALUES (?1, ?2, ?3)
          ON CONFLICT(appareil, domaine) DO UPDATE SET expire_at = excluded.expire_at",
@@ -681,7 +750,7 @@ async fn quiz_valider(
     Json(ValiderResponse {
         ok: true,
         duree_min: duree,
-        message: format!("Bravo ! 🎉 Débloqué pour {duree} minutes."),
+        message: format!("Bravo ! 🎉 Débloqué pour {}.", format_duree(duree)),
         bonne,
     })
 }

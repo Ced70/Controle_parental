@@ -61,6 +61,14 @@
 
     const carte = document.getElementById("carte");
 
+    // « 1 min », « 2 min 30 »… (les durées de config.json peuvent être fractionnaires)
+    const fmtMin = (m) => {
+      const t = Math.round(m * 60);
+      const mn = Math.floor(t / 60), s = t % 60;
+      if (!mn) return `${s} s`;
+      return s ? `${mn} min ${String(s).padStart(2, "0")}` : `${mn} min`;
+    };
+
     // --- Petite musique d'ouverture (générée, pas de fichier) ---------------
     function jouerJingle() {
       try {
@@ -105,7 +113,7 @@
       for (const n of NIVEAUX) {
         const b = document.createElement("button");
         b.style.background = n.couleur;
-        b.textContent = `${n.label} — débloque ${n.minutes} min`;
+        b.textContent = `${n.label} — débloque ${fmtMin(n.minutes)}`;
         b.onclick = () => chargerQuestion(n);
         carte.appendChild(b);
       }
@@ -114,16 +122,23 @@
     const dejaVues = new Set(); // pour éviter de reproposer une question récente
     async function chargerQuestion(n) {
       carte.innerHTML = "<p class='sous'>Chargement…</p>";
+      const url = "/quiz/question?niveau=" + n.cle +
+        (appareil ? "&appareil=" + encodeURIComponent(appareil) : "");
       try {
         let q = null;
         for (let essai = 0; essai < 6; essai++) {
-          q = await (await fetch("/quiz/question?niveau=" + n.cle)).json();
+          q = await (await fetch(url)).json();
           if (!q || !q.choix) throw 0;
-          if (!dejaVues.has(q.id)) break;
+          // Question épinglée par le serveur (déjà distribuée, jamais répondue) :
+          // on la montre telle quelle, pas de tirage anti-répétition.
+          if (q.epinglee || !dejaVues.has(q.id)) break;
         }
         if (dejaVues.size > 60) dejaVues.clear();
         dejaVues.add(q.id);
-        ecranQuestion(n, q);
+        // Le serveur peut renvoyer une question d'un autre niveau que celui
+        // demandé (épinglage) : on affiche le badge du niveau réel.
+        const niv = NIVEAUX.find((x) => x.cle === q.niveau) || n;
+        ecranQuestion(niv, q);
       } catch (e) {
         ecranNiveaux("Impossible de charger la question, réessaie.");
       }
@@ -133,7 +148,7 @@
       carte.innerHTML = "";
       const badge = document.createElement("div");
       badge.className = "badge"; badge.style.background = n.couleur;
-      badge.textContent = `${n.label} · ${n.minutes} min`;
+      badge.textContent = `${n.label} · ${fmtMin(n.minutes)}`;
       const h = document.createElement("h2");
       h.textContent = q.enonce;
       carte.append(badge, h);
@@ -142,7 +157,8 @@
       info.className = "retour";
 
       let essais = 0;
-      let verrou = false; // empêche le double-clic pendant l'appel réseau
+      let verrou = false;       // empêche le double-clic pendant l'appel réseau
+      let derniereBonne = -1;   // index de la bonne réponse, connu après un échec
       const boutons = [];
 
       q.choix.forEach((choix, i) => {
@@ -154,11 +170,43 @@
         carte.appendChild(b);
       });
 
-      const chg = document.createElement("button");
-      chg.style.background = "#0f172a";
-      chg.textContent = "← Changer de difficulté";
-      chg.onclick = () => ecranNiveaux("Choisis un défi :");
-      carte.append(info, chg);
+      // Pas d'échappatoire avant d'avoir répondu : le bouton « Passer »
+      // n'apparaît qu'après un premier échec, et il révèle la correction 5 s.
+      const passer = document.createElement("button");
+      passer.style.background = "#0f172a";
+      passer.textContent = "Passer → (la bonne réponse s'affichera 5 s)";
+      passer.style.display = "none";
+      passer.onclick = () => {
+        if (!verrou) reveler(5, () => ecranNiveaux("Choisis un défi :"));
+      };
+      carte.append(info, passer);
+
+      if (q.epinglee) {
+        info.style.color = "#fbbf24";
+        info.textContent = "Termine d'abord cette question 😉";
+      }
+
+      // Révèle la bonne réponse, fige tout pendant `secondes`, puis enchaîne.
+      function reveler(secondes, ensuite) {
+        verrou = true;
+        boutons.forEach((b) => (b.disabled = true));
+        passer.disabled = true;
+        if (derniereBonne >= 0 && boutons[derniereBonne]) {
+          boutons[derniereBonne].style.background = "#166534"; // vert
+          boutons[derniereBonne].style.opacity = "1";
+        }
+        const bonneTxt = (derniereBonne >= 0 && q.choix[derniereBonne] != null)
+          ? q.choix[derniereBonne] : "?";
+        let reste = secondes;
+        info.style.color = "#fbbf24";
+        const maj = () => (info.textContent =
+          `La bonne réponse était « ${bonneTxt} ». Suite dans ${reste} s…`);
+        maj();
+        const tic = setInterval(() => {
+          reste -= 1;
+          if (reste <= 0) { clearInterval(tic); ensuite(); } else { maj(); }
+        }, 1000);
+      }
 
       async function repondre(i, bouton) {
         if (verrou) return;
@@ -190,31 +238,18 @@
         bouton.disabled = true;
         bouton.style.background = "#7f1d1d";
         bouton.style.opacity = "0.6";
+        if (r && r.bonne >= 0) derniereBonne = r.bonne;
 
         if (essais < 2) {
           info.style.color = "#f87171";
-          info.textContent = "❌ Mauvaise réponse — il te reste 1 essai. Lis bien la question !";
+          info.textContent = "❌ Mauvaise réponse — retente ta chance, ou passe à la suivante.";
+          passer.style.display = "block"; // il a répondu : le passage devient possible
           verrou = false; // on autorise le 2e essai
           return;
         }
 
-        // 2e échec : on révèle la bonne réponse, on bloque tout, délai de 10 s, puis nouvelle question.
-        boutons.forEach((b) => (b.disabled = true));
-        if (r.bonne >= 0 && boutons[r.bonne]) {
-          boutons[r.bonne].style.background = "#166534"; // vert
-          boutons[r.bonne].style.opacity = "1";
-        }
-        chg.disabled = true;
-        const bonneTxt = (r.bonne >= 0 && q.choix[r.bonne] != null) ? q.choix[r.bonne] : "?";
-        let reste = 10;
-        info.style.color = "#fbbf24";
-        const maj = () => (info.textContent =
-          `La bonne réponse était « ${bonneTxt} ». Nouvelle question dans ${reste} s…`);
-        maj();
-        const tic = setInterval(() => {
-          reste -= 1;
-          if (reste <= 0) { clearInterval(tic); chargerQuestion(n); } else { maj(); }
-        }, 1000);
+        // 2e échec : révélation 10 s, puis nouvelle question du même niveau.
+        reveler(10, () => chargerQuestion(n));
       }
     }
 
